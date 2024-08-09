@@ -2348,6 +2348,10 @@ function updateSensorsRk3588() {
   updateSensorThermal(0, 'SoC temperature');
 }
 
+function updateSensorsN100() {
+  updateSensorThermal(1, 'CPU temperature');
+}
+
 function updateSensors() {
   sensorsFunc();
   broadcastMsg('sensors', sensors, getms() - ACTIVE_TO);
@@ -2360,6 +2364,9 @@ switch (setup.hw) {
     break;
   case 'rk3588':
     sensorsFunc = updateSensorsRk3588;
+    break;
+  case 'n100':
+    sensorsFunc = updateSensorsN100;
     break;
   default:
     console.log(`Unknown sensors for ${setup.hw}`);
