@@ -1996,7 +1996,7 @@ async function mmSetNetworkTypes(id, allowed, preferred) {
   }
 }
 
-async function mmNetworkScan(id, timeout=120) {
+async function mmNetworkScan(id, timeout=240) {
   try {
     const result = await execFileP("mmcli", [`--timeout=${timeout}`, "-K", "-m", id, "--3gpp-scan"]);
     const networks = mmcliParseSep(result.stdout.toString("utf-8"))['modem.3gpp.scan-networks'];
