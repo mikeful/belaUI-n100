@@ -2414,7 +2414,7 @@ async function updateModems() {
   for (const m in modems) {
     modems[m].removed = true;
   }
-  const modemList = await mmList() || {};
+  const modemList = await mmList() || [];
 
   // NM gsm connections to match with new modems - filled on demand if any new modems have been found
   gsmConns = undefined;
