@@ -2263,13 +2263,11 @@ async function modemNetworkScan(id) {
 
 async function registerModem(id) {
   if (modems[id]) {
-    console.log(`Trying to register existing modem id ${id}`);
-    return;
+    throw new Error(`Trying to register existing modem id ${id}`);
   }
 
   // Get all the required info for the modem
   const modemInfo = await mmGetModem(id);
-  if (!modemInfo) return false;
 
   let simInfo, config;
   if (modemInfo['modem.generic.sim']) {
@@ -2328,8 +2326,6 @@ async function registerModem(id) {
   modemUpdateStatus(modemInfo, modem);
 
   modems[id] = modem;
-
-  return true;
 }
 
 function modemGetAvailableNetworks(modem) {
@@ -2447,9 +2443,12 @@ async function updateModems() {
         }
       }
     } else {
-      if (await registerModem(m)) {
+      try {
+        await registerModem(m);
         newModems[m] = true;
         console.log(JSON.stringify(modems[m], undefined, 2));
+      } catch(e) {
+        console.log(`Failed to register modem ${m}`);
       }
     }
   } // for (const m of modemList)
