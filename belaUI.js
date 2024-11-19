@@ -2161,7 +2161,7 @@ async function modemGetConfig(modemInfo, simInfo, gsmConns) {
     return config;
   }
 
-  if (gsmConns && gsmConns.byOperator[operatorId]) {
+  if (gsmConns && operatorId && gsmConns.byOperator[operatorId]) {
     // Copy the settings from an existing config for the same operator
     const ci = gsmConns.byOperator[operatorId];
     config = {autoconfig: ci.autoconfig, apn: ci.apn, username: ci.username, password: ci.password,
@@ -2180,9 +2180,11 @@ async function modemGetConfig(modemInfo, simInfo, gsmConns) {
     'connection.autoconnect-retries': 10,
     'ipv6.method': 'ignore',
     'gsm.device-id': modemId,
-    'gsm.sim-operator-id': operatorId,
     'gsm.sim-id': simId
   };
+  if (operatorId) {
+    nmConfig['gsm.sim-operator-id'] = operatorId;
+  }
   Object.assign(nmConfig, modemConfigSantizeToNM(config))
   const uuid = await nmConnAdd(nmConfig);
   if (uuid) {
