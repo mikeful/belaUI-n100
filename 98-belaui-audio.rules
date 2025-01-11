@@ -9,8 +9,11 @@ ACTION!="change", GOTO="end"
 # the Cam Link 4K's audio id defaults to C4K - don't modify it
 ATTR{id}=="C4K", GOTO="signal_belaui"
 
-# don't rename the OA4 audio input
+# don't rename the OA4 and OP3 audio inputs
 ATTR{id}=="OsmoAction4", GOTO="signal_belaui"
+ATTR{id}=="DJIPocket3", GOTO="signal_belaui"
+# the OA5's name might include part of the SN, discard it
+ATTR{id}=="OsmoAction5*", ATTR{id}="OsmoAction5", GOTO="signal_belaui"
 
 # set the id for the first USB audio card that's not a camlink 4K
 ATTR{id}="usbaudio"
