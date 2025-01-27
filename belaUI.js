@@ -357,7 +357,7 @@ function updateNetif() {
           }
         }
 
-        if (name == 'lo' || name.match('^docker') || name.match('^l4tbr')) continue;
+        if (name == 'lo' || name.match('^docker') || name.match('^l4tbr') || name.match('^wg')) continue;
 
         if (!inetAddr) continue;
         if (!isRunning) continue;
