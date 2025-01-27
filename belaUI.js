@@ -33,6 +33,7 @@ const SETUP_FILE = 'setup.json';
 const CONFIG_FILE = 'config.json';
 const AUTH_TOKENS_FILE = 'auth_tokens.json';
 const RELAYS_CACHE_FILE = 'relays_cache.json';
+const GSM_OPERATORS_CACHE_FILE = 'gsm_operator_cache.json';
 
 const DNS_CACHE_FILE = 'dns_cache.json';
 /* Minimum age of an updated record to trigger a persistent DNS cache update (in ms)
@@ -258,68 +259,6 @@ function broadcastMsgExcept(conn, type, data) {
     const msg = buildMsg(type, data, conn.senderId);
     remoteWs.send(msg);
   }
-}
-
-
-/* Read the list of pipeline files */
-function readDirAbsPath(dir, excludePattern) {
-  const pipelines = {};
-
-  try {
-    const files = fs.readdirSync(dir);
-    const basename = path.basename(dir);
-
-    for (const f in files) {
-      const name = basename + '/' + files[f];
-      if (excludePattern && name.match(excludePattern)) continue;
-
-      const id = crypto.createHash('sha1').update(name).digest('hex');
-      const path = dir + files[f];
-      pipelines[id] = {name: name, path: path};
-    }
-  } catch (err) {
-    console.log(`Failed to read the pipeline files in ${dir}:`);
-    console.log(err);
-  };
-
-  return pipelines;
-}
-
-async function getPipelines() {
-  const ps = {};
-  Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + '/custom/'));
-
-  // Get the hardware-specific pipelines
-  let excludePipelines;
-  if (setup.hw == 'rk3588' && !fs.existsSync('/dev/hdmirx')) {
-    excludePipelines = 'h265_hdmi';
-  }
-  Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + `/${setup.hw}/`, excludePipelines));
-
-  Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + '/generic/'));
-
-  for (const p in ps) {
-    const props = await pipelineGetAudioProps(ps[p].path)
-    Object.assign(ps[p], props);
-  }
-
-  return ps;
-}
-
-async function searchPipelines(id) {
-  const pipelines = await getPipelines();
-  if (pipelines[id]) return pipelines[id];
-  return null;
-}
-
-// pipeline list in the format needed by the frontend
-async function getPipelineList() {
-  const pipelines = await getPipelines();
-  const list = {};
-  for (const id in pipelines) {
-    list[id] = {name: pipelines[id].name, asrc: pipelines[id].asrc, acodec: pipelines[id].acodec};
-  }
-  return list;
 }
 
 
@@ -967,6 +906,26 @@ function wifiDeviceListGetInetAddr(ifname) {
 
 
 /* NetworkManager / nmcli helpers */
+async function nmConnAdd(fields) {
+  try {
+    let args = [
+      "connection",
+      "add"
+    ];
+    for (const field in fields) {
+      args.push(field);
+      args.push(fields[field]);
+    }
+    const result = await execFileP("nmcli", args);
+    const success = result.stdout.match(/Connection '.+' \((.+)\) successfully added./);
+
+    if (success) return success[1];
+
+  } catch ({message}) {
+    console.log(`nmConnNew err: ${message}`);
+  }
+}
+
 async function nmConnsGet(fields) {
   try {
     const result = await execFileP("nmcli", [
@@ -1902,6 +1861,720 @@ function handleWifi(conn, msg) {
 }
 
 
+/*
+  mmcli helpers
+*/
+function mmcliParseSep(input) {
+  let output = {};
+  for (let line of input.split('\n')) {
+    line = line.replace(/\\\d+/g, ''); // strips special escaped characters
+    if (!line) continue;
+
+    const kv = line.split(/:(.*)/); // splits on the first ':' only
+    if (kv.length != 3) {
+      console.log(`mmcliParseSep: error parsing line ${line}`);
+      continue;
+    }
+    let key = kv[0].trim();
+    let value = kv[1].trim();
+
+    // Parse mmcli arrays
+    let pattern = /\.length$/;
+    if (key.match(pattern)) {
+      key = key.replace(pattern, '');
+      value = [];
+    }
+    pattern = /\.value\[\d+\]$/;
+    if (key.match(pattern)) {
+      key = key.replace(pattern, '');
+      output[key].push(value);
+      continue;
+    }
+
+    // skip empty values
+    if (value == '--') continue;
+
+    output[key] = value;
+  }
+
+  return output;
+}
+
+function mmConvertNetworkType(mmType) {
+  const typeMatch = mmType.match(/^allowed: (.+); preferred: (.+)$/);
+  const label = typeMatch[1].split(/,? /).sort().reverse().join('');
+  const allowed = typeMatch[1].replace(/,? /g, '|');
+  const preferred = typeMatch[2];
+  return {label, allowed, preferred};
+}
+
+function mmConvertNetworkTypes(mmTypes) {
+  const types = {};
+  for (const mmType of mmTypes) {
+    const type = mmConvertNetworkType(mmType);
+    if (!types[type.label] || types[type.label].preferred == 'none' || types[type.label].preferred < type.preferred) {
+      types[type.label] = {allowed: type.allowed, preferred: type.preferred};
+    }
+  }
+  return types;
+}
+
+function mmConvertAccessTech(accessTechs) {
+  if (!accessTechs || accessTechs.length == 0) {
+    return;
+  }
+
+  const accessTechToGen = {
+    'gsm': '2G',
+    'umts': '3G',
+    'hsdpa': '3G+',
+    'hsupa': '3G+',
+    'lte': '4G',
+    '5gnr': '5G'
+  };
+  // Return the highest gen for situations such as 5G NSA, which will report "lte, 5gnr"
+  let gen = '';
+  for (const t of accessTechs) {
+    if (accessTechToGen[t] > gen) {
+      gen = accessTechToGen[t];
+    }
+  }
+
+  // If we only encountered unknown access techs, simply return the first one
+  if (!gen) return accessTechs[0];
+  return gen;
+}
+
+async function mmList() {
+  try {
+    const result = await execFileP("mmcli", ["-K", "-L"]);
+    const modems = mmcliParseSep(result.stdout.toString("utf-8"))['modem-list'];
+    let list = [];
+    for (const m of modems) {
+      const id = m.match(/\/org\/freedesktop\/ModemManager1\/Modem\/(\d+)/);
+      if (id) {
+        list.push(parseInt(id[1]));
+      }
+    }
+    return list;
+  } catch ({message}) {
+    console.log(`mmList err: ${message}`);
+  }
+}
+
+async function mmGetModem(id) {
+  try {
+    const result = await execFileP("mmcli", ["-K", "-m", id]);
+    return mmcliParseSep(result.stdout.toString("utf-8"));
+  } catch ({message}) {
+    console.log(`mmGetModem err: ${message}`);
+  }
+}
+
+async function mmGetSim(id) {
+  try {
+    const result = await execFileP("mmcli", ["-K", "-i", id]);
+    return mmcliParseSep(result.stdout.toString("utf-8"));
+  } catch ({message}) {
+    console.log(`mmGetSim err: ${message}`);
+  }
+}
+
+async function mmSetNetworkTypes(id, allowed, preferred) {
+  try {
+    let args = [
+      "-m", id,
+      `--set-allowed-modes=${allowed}`
+    ];
+    if (preferred != 'none') {
+      args.push(`--set-preferred-mode=${preferred}`);
+    }
+    const result = await execFileP("mmcli", args);
+    return result.stdout.match(/successfully set current modes in the modem/);
+  } catch ({message}) {
+    console.log(`mmSetNetworkTypes err: ${message}`);
+  }
+}
+
+async function mmNetworkScan(id, timeout=240) {
+  try {
+    const result = await execFileP("mmcli", [`--timeout=${timeout}`, "-K", "-m", id, "--3gpp-scan"]);
+    const networks = mmcliParseSep(result.stdout.toString("utf-8"))['modem.3gpp.scan-networks'];
+    const parsed = networks.map(function(n) {
+      const info = n.split(/, */);
+      const output = {};
+      for (const entry of info) {
+        const kv = entry.split(/: */);
+        output[kv[0]] = kv[1];
+      }
+      return output;
+    });
+    return parsed;
+  } catch ({message}) {
+    console.log(`mmNetworkScan err: ${message}`);
+  }
+}
+
+
+/*
+  ModemManager / NetworkManager based modem management
+
+  Structs:
+
+  Modem list <modems>:
+  {
+    MMid: <modem>
+  }
+
+  Individual modem struct <modem>:
+  {
+    ifname: wwan0,
+    name: "QUECTEL Broadband Module - 00000 | VINAPHONE", <Model - partial IMEI | SIM provider>
+    network_type: {
+      supported: ['2g', 3g', '3g4g', '4g'],
+      config: '3g4g',
+    },
+    is_scanning: true/undefined,
+    inhibit: true/undefined, // don't bring up automatically
+    config: {
+      conn: 'nmUuid',
+      autoconfig: true/false, // only if(setup.has_gsm_autoconfig)
+      apn: '',
+      username: '',
+      password: '',
+      roaming: true/false,
+      network: ''
+    },
+    status: {
+      state: 'connecting', 'connected', 'disconnected', etc
+      network: '<GSM NETWORK NAME>',
+      network_type: 3g/4g,
+      signal: 0-100,
+      roaming: true/false,
+    }
+    available_networks: undefined or {
+      'id': {
+        name: '',
+        availability: 'available', 'forbidden', etc
+      }
+    }
+  }
+*/
+let modems = {};
+
+let gsmOperatorsCache = {};
+try {
+  gsmOperatorsCache = JSON.parse(fs.readFileSync(GSM_OPERATORS_CACHE_FILE, 'utf8'));
+} catch(err) {
+  console.log("Failed to load the persistent GSM operators cache, starting with an empty cache");
+}
+async function gsmOperatorsAdd(id, name) {
+  if (!gsmOperatorsCache[id] || gsmOperatorsCache[id] != name) {
+    gsmOperatorsCache[id] = name;
+    await writeTextFile(GSM_OPERATORS_CACHE_FILE, JSON.stringify(gsmOperatorsCache));
+  }
+}
+
+async function getGsmConns() {
+  let byDevice = {};
+  let byOperator = {};
+  let byUuid = {};
+
+  const conns = await nmConnsGet("uuid,type,state");
+  for (const c of conns) {
+    const [uuid, type, state] = nmcliParseSep(c);
+
+    if (type != 'gsm') continue;
+
+    let fields = "gsm.device-id,gsm.sim-id,gsm.sim-operator-id,gsm.apn,gsm.username,gsm.password,gsm.home-only,gsm.network-id"
+    if (setup.has_gsm_autoconfig) {
+      fields += ",gsm.auto-config";
+    }
+    const connInfo = await nmConnGetFields(uuid, fields);
+
+    const deviceId = connInfo[0];
+    const simId = connInfo[1];
+    const operatorId = connInfo[2];
+    const apn = connInfo[3];
+    const username = connInfo[4];
+    const password = connInfo[5];
+    const roaming = (connInfo[6] == 'no');
+    const network = connInfo[7];
+
+    const conn = {state, uuid, deviceId, simId, operatorId, apn, username, password, roaming, network};
+    if (setup.has_gsm_autoconfig) {
+      conn.autoconfig = (connInfo[8] == 'yes');
+    }
+
+    byUuid[uuid] = conn;
+
+    if (deviceId && simId) {
+      if (!byDevice[deviceId]) {
+        byDevice[deviceId] = {};
+      }
+      byDevice[deviceId][simId] = conn;
+    }
+
+    if (operatorId) {
+      byOperator[operatorId] = conn;
+    }
+  }
+
+  return {byDevice, byOperator, byUuid};
+}
+
+function modemConfigSantizeToNM(config) {
+  fields = {};
+  if (setup.has_gsm_autoconfig) {
+    fields['gsm.auto-config'] = (config.autoconfig ? 'yes' : 'no');
+    if (config.autoconfig) {
+      config.apn = '';
+      config.username = '';
+      config.password = '';
+    }
+  } else {
+    delete config.autoconfig;
+  }
+  fields['gsm.apn'] = config.apn;
+  fields['gsm.username'] = config.username;
+  fields['gsm.password'] = config.password;
+  fields['gsm.password-flags'] = (!config.password ? 4 : 0);
+  fields['gsm.home-only'] = (config.roaming ? 'no': 'yes');
+  fields['gsm.network-id'] = (config.roaming ? config.network : '');
+
+  return fields;
+}
+
+async function modemGetConfig(modemInfo, simInfo, gsmConns) {
+  if (!modemInfo || !simInfo || !gsmConns) return;
+
+  const modemId = modemInfo['modem.generic.device-identifier'];
+  const simId = simInfo['sim.properties.iccid'];
+  const operatorId = simInfo['sim.properties.operator-code'];
+  let config;
+
+  if (gsmConns.byDevice[modemId] && gsmConns.byDevice[modemId][simId]) {
+    const ci = gsmConns.byDevice[modemId][simId];
+    config = {conn: ci.uuid, autoconfig: ci.autoconfig, apn: ci.apn, username: ci.username,
+              password: ci.password, roaming: ci.roaming, network: ci.network};
+    console.log(`Found NM connection ${config.conn} for modem ${modemId}`);
+    return config;
+  }
+
+  if (gsmConns && operatorId && gsmConns.byOperator[operatorId]) {
+    // Copy the settings from an existing config for the same operator
+    const ci = gsmConns.byOperator[operatorId];
+    config = {autoconfig: ci.autoconfig, apn: ci.apn, username: ci.username, password: ci.password,
+              roaming: ci.roaming, network: ci.network};
+  } else {
+    // New connection profile
+    config = {autoconfig: true, apn: 'internet', username: '', password: '', roaming: true, network: ''};
+  }
+
+  // The NM connection doesn't exist yet, create it
+  //const autoconnect = (modemInfo['modem.3gpp.registration-state'] != 'idle') ? 'yes' : 'no';
+  const nmConfig = {
+    'type': 'gsm',
+    'ifname': '', // can be empty for gsm connections, matching by device-id and sim-id
+    'autoconnect': 'yes',
+    'connection.autoconnect-retries': 10,
+    'ipv6.method': 'ignore',
+    'gsm.device-id': modemId,
+    'gsm.sim-id': simId
+  };
+  if (operatorId) {
+    nmConfig['gsm.sim-operator-id'] = operatorId;
+  }
+  Object.assign(nmConfig, modemConfigSantizeToNM(config))
+  const uuid = await nmConnAdd(nmConfig);
+  if (uuid) {
+    config.conn = uuid;
+    console.log(`Created NM connection ${uuid} for ${modemId}`);
+    console.log(config);
+  }
+
+  return config;
+}
+
+function modemUpdateStatus(modemInfo, modem) {
+  // Some modems don't seem to always report the operator's name
+  let network = modemInfo['modem.3gpp.operator-name'];
+  if (!network && modemInfo['modem.3gpp.registration-state'] == 'home') {
+    network = modem.sim_network;
+  }
+  const network_type = mmConvertAccessTech(modemInfo['modem.generic.access-technologies']);
+  const signal = modemInfo['modem.generic.signal-quality.value'];
+  const roaming = modemInfo['modem.3gpp.registration-state'] == 'roaming';
+  let connection = modem.is_scanning ? 'scanning' : modemInfo['modem.generic.state'];
+
+  modem.status = {connection, network, network_type, signal, roaming};
+}
+
+async function modemNetworkScan(id) {
+  const modem = modems[id];
+
+  if (!modem || !modem.config || !modem.status || modem.is_scanning) return;
+
+  modem.is_scanning = true;
+
+  if (modem.config && modem.config.conn) {
+    await nmDisconnect(modem.config.conn);
+  }
+  const results = await mmNetworkScan(id);
+
+  delete modem.is_scanning;
+
+  /* Even if no new results are returned, resend the old ones
+     to inform the clients that the scan was completed */
+  if (!results) {
+    broadcastModemAvailableNetworks(id);
+    return;
+  }
+
+  /* Some (but not all) modems return separate results for each network type (3G, 4G, etc),
+     but we merge them as we have a separate network type setting */
+  const availableNetworks = {};
+  for (const r of results) {
+    const code = r['operator-code'];
+    /* We rewrite 'current' to 'available' as these results are cached
+       and could be shown even after switching to a different network.
+       We remove the availability info if 'unknown' */
+    switch (r.availability) {
+      case 'current':
+        r.availability = 'available';
+        break;
+      case 'unknown':
+        delete r.availability;
+        break;
+    }
+    if (availableNetworks[code]) {
+      if (r.availability == 'available' && availableNetworks[code].availability != 'available') {
+        availableNetworks[code].availability = 'available';
+      }
+    } else {
+      availableNetworks[code] = {
+        name: r['operator-name'],
+        availability: r['availability']
+      };
+    }
+  }
+
+  modem.available_networks = availableNetworks;
+  broadcastModemAvailableNetworks(id);
+}
+
+async function registerModem(id) {
+  if (modems[id]) {
+    throw new Error(`Trying to register existing modem id ${id}`);
+  }
+
+  // Get all the required info for the modem
+  const modemInfo = await mmGetModem(id);
+
+  let simInfo, config;
+  if (modemInfo['modem.generic.sim']) {
+    const simId = modemInfo['modem.generic.sim'].match(/\/org\/freedesktop\/ModemManager1\/SIM\/(\d+)/);
+    if (simId) {
+      simInfo = await mmGetSim(simId[1]);
+      // If a SIM is present, try to find a matching NM connection or create one
+      if (simInfo) {
+        if (!gsmConns) {
+          gsmConns = await getGsmConns();
+        }
+        config = await modemGetConfig(modemInfo, simInfo, gsmConns);
+      }
+    }
+  }
+
+  // Find the network interface name
+  let ifname;
+  for (const port of modemInfo['modem.generic.ports']) {
+    const pattern = / \(net\)$/;
+    if (port.match(pattern)) {
+      ifname = port.replace(pattern, '');
+      break;
+    }
+  }
+
+  // Find the current network type
+  let networkType = mmConvertNetworkType(modemInfo['modem.generic.current-modes']);
+
+  // Find the supported network types
+  const networkTypes = mmConvertNetworkTypes(modemInfo['modem.generic.supported-modes']);
+
+  // Make sure the current mode is on the list
+  if (networkType && !networkTypes[networkType.label]) {
+    networkTypes[networkType.label] = {allowed: networkType.allowed, preferred: networkType.preferred};
+  }
+  networkType = networkType.label;
+
+  let partialImei = modemInfo['modem.generic.equipment-identifier'];
+  partialImei = partialImei.substr(partialImei.length - 5, 5);
+  const hwName = `${modemInfo['modem.generic.model']} - ${partialImei}`
+
+  let simNetwork = '<NO SIM>';
+  if (simInfo) {
+    simNetwork = simInfo['sim.properties.operator-name'] || 'Unknown';
+  }
+
+  const modem = {};
+  modem.ifname = ifname;
+  modem.name = `${hwName} | ${simNetwork}`;
+  modem.sim_network = simNetwork;
+  modem.network_type = {};
+  modem.network_type.supported = networkTypes;
+  modem.network_type.active = networkType;
+  modem.config = config;
+  modemUpdateStatus(modemInfo, modem);
+
+  modems[id] = modem;
+}
+
+function modemGetAvailableNetworks(modem) {
+  if (!modem.config || modem.config.network == '') return modem.available_networks || {};
+
+  let networks = Object.assign({}, modem.available_networks);
+  if (!modem.available_networks) {
+    const name = gsmOperatorsCache[modem.config.network] || `Operator ID ${modem.config.network}`;
+    networks[modem.config.network] = {name};
+  } else if (!modem.available_networks[modem.config.network]) {
+    networks[modem.config.network] = {name: 'Test', availability: 'unavailable'};
+  }
+
+  return networks;
+}
+
+function modemsBuildMsg(modemsFullState = undefined) {
+  let msg = {};
+  for (const i in modems) {
+    const full = (modemsFullState == undefined || modemsFullState[i]);
+
+    msg[i] = {};
+
+    if (full) {
+      msg[i].ifname = modems[i].ifname;
+      msg[i].name = modems[i].name;
+      msg[i].network_type = {};
+      msg[i].network_type.supported = Object.keys(modems[i].network_type.supported);
+      msg[i].network_type.active = modems[i].network_type.active;
+
+      if (modems[i].config) {
+        msg[i].config = {};
+        if (setup.has_gsm_autoconfig) {
+          msg[i].config.autoconfig = modems[i].config.autoconfig;
+        }
+        msg[i].config.apn = modems[i].config.apn;
+        msg[i].config.username = modems[i].config.username;
+        msg[i].config.password = modems[i].config.password;
+        msg[i].config.roaming = modems[i].config.roaming;
+        msg[i].config.network = modems[i].config.network;
+      } else {
+        msg[i].no_sim = true;
+      }
+
+      msg[i].available_networks = modemGetAvailableNetworks(modems[i]);
+    }
+
+    if (!modems[i].status) continue;
+
+    msg[i].status = {};
+    msg[i].status.connection = modems[i].status.connection;
+    msg[i].status.network = modems[i].status.network;
+    msg[i].status.network_type = modems[i].status.network_type;
+    msg[i].status.signal = modems[i].status.signal;
+    msg[i].status.roaming = modems[i].status.roaming;
+  }
+
+  return msg;
+}
+
+function broadcastModems(modemsFullState = undefined) {
+  broadcastMsg('status', {modems: modemsBuildMsg(modemsFullState)});
+}
+
+function modemBuildAvailableNetworksMessage(id) {
+  const msg = {};
+
+  for (const i in modems) {
+    msg[i] = {};
+    if (id == i) {
+      msg[i].available_networks = modemGetAvailableNetworks(modems[i]);
+    }
+  }
+
+  return msg;
+}
+
+function broadcastModemAvailableNetworks(id) {
+  broadcastMsg('status', {modems: modemBuildAvailableNetworksMessage(id)});
+}
+
+// Global variable, to allow fetching once in updateModems() and reuse in registerModem()
+let gsmConns;
+
+async function updateModems() {
+  for (const m in modems) {
+    modems[m].removed = true;
+  }
+  const modemList = await mmList() || [];
+
+  // NM gsm connections to match with new modems - filled on demand if any new modems have been found
+  gsmConns = undefined;
+  let newModems = {};
+
+  for (const m of modemList) {
+    if (modems[m]) {
+      // The modem is already registered, unmark it for deletion
+      delete modems[m].removed;
+
+      const modemInfo = await mmGetModem(m);
+      if (!modemInfo) continue;
+
+      const modem = modems[m];
+      modemUpdateStatus(modemInfo, modem);
+
+      // If the modem has an inactive NM connection and isn't otherwise busy, then try to bring it up
+      if (!modem.inhibit && !modem.is_scanning &&
+          modem.status && (modem.status.connection == 'registered' || modem.status.connection == 'enabled') &&
+          modem.config && modem.config.conn) {
+        // Don't try to activate NM connections that are already active
+        const nmConnection = (await nmConnGetFields(modem.config.conn, 'GENERAL.STATE'));
+        if (nmConnection.length == 1) {
+          console.log(`Trying to bring up connection ${modem.config.conn} for modem ${m}...`);
+          nmConnect(modem.config.conn);
+        }
+      }
+    } else {
+      try {
+        await registerModem(m);
+        newModems[m] = true;
+        console.log(JSON.stringify(modems[m], undefined, 2));
+      } catch(e) {
+        console.log(`Failed to register modem ${m}`);
+      }
+    }
+  } // for (const m of modemList)
+
+  // If any modems were removed, delete them
+  for (const m in modems) {
+    if (modems[m].removed) {
+      console.log(`Modem ${m} removed`);
+      delete modems[m];
+    }
+  }
+
+  broadcastModems(newModems);
+
+  setTimeout(updateModems, 1000);
+}
+updateModems();
+
+async function handleModemConfig(conn, msg) {
+  if (!msg.device || !modems[msg.device]) {
+    console.log(`Ignoring modem config for unknown modem ${msg.device}`);
+    return;
+  }
+
+  const modem = modems[msg.device];
+  if (!modem.config || !modem.config.conn) {
+    console.log(`Ignoring modem config for unconfigured modem ${msg.device}`);
+    console.log(modem.config);
+    return;
+  }
+  const connUuid = modem.config.conn;
+  if (!connUuid) {
+    console.log(`Ignoring modem config for modem ${msg.device} with no connection UUID`);
+    return;
+  }
+
+  // Ensure the configuration message has all the required fields
+  if ((msg.roaming !== true && msg.roaming !== false) ||
+      (msg.autoconfig !== true && msg.autoconfig !== false) ||
+      (typeof msg.apn != 'string') ||
+      (typeof msg.username != 'string') ||
+      (typeof msg.password != 'string') ||
+      (typeof msg.network != 'string') ||
+      (typeof msg.network_type != 'string')) {
+    console.log(`Received invalid configuration for modem ${msg.device}`);
+    console.log(msg);
+    return;
+  }
+
+  // Ensure the selected network type is supported
+  const networkType = modem.network_type.supported[msg.network_type];
+  if (!networkType) {
+    console.log(`Received invalid network type ${msg.network_type} for modem ${msg.device}`);
+    return;
+  }
+
+  // Only allow automatic network selection, the network previously saved, or a network included in the scan results
+  if (msg.network != '' && msg.network != modem.config.network &&
+      (!modem.available_networks || !modem.available_networks[msg.network])) {
+    console.log(`Received unavailable network ${msg.network} for modem ${msg.device}`);
+    return;
+  }
+
+  // If a new network is selected, write it to the GSM operators cache
+  if (msg.network != '' && modem.available_networks && modem.available_networks[msg.network]) {
+    gsmOperatorsAdd(msg.network, modem.available_networks[msg.network].name);
+  }
+
+  // Temporary config that we'll attempt to write
+  let updatedConfig = {
+    autoconfig: msg.autoconfig,
+    apn: msg.apn,
+    username: msg.username,
+    password: msg.password,
+    roaming: msg.roaming,
+    network: msg.network
+  }
+  // This also modifies config in place to clear apn/username/password if autoconfig is set
+  const result = await nmConnSetFields(connUuid, modemConfigSantizeToNM(updatedConfig));
+  if (result) {
+    // This preserves the 'conn' UUID value
+    Object.assign(modem.config, updatedConfig);
+  } else {
+    console.log(`Failed to update NM connection ${modem.config.conn} for modem ${msg.device} to:`);
+    console.log(updatedConfig);
+  }
+
+  // Bring the connection down to reload the settings, and set the network types, if needed
+  modem.inhibit = true;
+  await nmDisconnect(connUuid);
+  if (msg.network_type != modem.network_type.active) {
+    const result = await mmSetNetworkTypes(msg.device, networkType.allowed, networkType.preferred);
+    if (result) {
+      modem.network_type.active = msg.network_type;
+    }
+  }
+  delete modem.inhibit;
+
+  // Send the updated settings to the clients
+  const updatedModem = {};
+  updatedModem[msg.device] = true;
+  broadcastModems(updatedModem);
+}
+
+async function handleModemScan(conn, msg) {
+  if (!msg || !modems[msg.device]) return;
+
+  await modemNetworkScan(msg.device);
+}
+
+function handleModems(conn, msg) {
+  for (const type in msg) {
+    switch (type) {
+      case 'config':
+        handleModemConfig(conn, msg[type]);
+        break;
+      case 'scan':
+        handleModemScan(conn, msg[type]);
+        break;
+    }
+  }
+}
+
+
 /* Remote */
 /*
   A brief remote protocol version history:
@@ -1918,8 +2591,9 @@ function handleWifi(conn, msg) {
   11 - support for the asrc and acodec settings
   12 - support for receiving relay accounts and relay servers
   13 - wifi hotspot mode
+  14 - support for the modem manager
 */
-const remoteProtocolVersion = 13;
+const remoteProtocolVersion = 14;
 const remoteEndpointHost = 'remote.belabox.net';
 const remoteEndpointPath = '/ws/remote';
 const remoteTimeout = 5000;
@@ -2508,9 +3182,9 @@ addAudioCardById(audioDevices, noAudioId);
 addAudioCardById(audioDevices, defaultAudioId);
 
 
-async function pipelineGetAudioProps(path) {
+function pipelineGetAudioProps(path) {
   const props = {};
-  const contents = await readTextFile(path);
+  const contents = fs.readFileSync(path, 'utf8');
   props.asrc = contents.match(alsaPipelinePattern) != null;
   props.acodec = contents.match(audioCodecPattern) != null;
   return props;
@@ -2555,7 +3229,7 @@ function addAudioCardById(list, id) {
 
 async function updateAudioDevices() {
   // Ignore the onboard audio cards
-  const exclude = ['tegrahda', 'tegrasndt210ref', 'rockchipdp0', 'rockchiphdmi0', 'rockchiphdmi1', 'rockchiphdmiind', 'rockchipes8316'];
+  const exclude = ['tegrahda', 'tegrasndt210ref', 'rockchipdp0', 'rockchiphdmi0', 'rockchiphdmi1', 'rockchiphdmi2', 'rockchiphdmiind', 'rockchipes8316'];
   // Devices to show at the top of the list
   const priority = ['HDMI', 'rockchiphdmiin', 'rockchipes8388', 'C4K', 'usbaudio'];
 
@@ -2600,6 +3274,67 @@ async function updateAudioDevices() {
   broadcastMsg('status', {asrcs: Object.keys(audioDevices)});
 }
 updateAudioDevices();
+
+
+/* Read the list of pipeline files */
+function readDirAbsPath(dir, excludePattern) {
+  const pipelines = {};
+
+  try {
+    const files = fs.readdirSync(dir);
+    const basename = path.basename(dir);
+
+    for (const f in files) {
+      const name = basename + '/' + files[f];
+      if (excludePattern && name.match(excludePattern)) continue;
+
+      const id = crypto.createHash('sha1').update(name).digest('hex');
+      const path = dir + files[f];
+      pipelines[id] = {name: name, path: path};
+    }
+  } catch (err) {
+    console.log(`Failed to read the pipeline files in ${dir}:`);
+    console.log(err);
+  };
+
+  return pipelines;
+}
+
+function getPipelines() {
+  const ps = {};
+  Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + '/custom/'));
+
+  // Get the hardware-specific pipelines
+  let excludePipelines;
+  if (setup.hw == 'rk3588' && !fs.existsSync('/dev/hdmirx')) {
+    excludePipelines = 'h265_hdmi';
+  }
+  Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + `/${setup.hw}/`, excludePipelines));
+
+  Object.assign(ps, readDirAbsPath(belacoderPipelinesDir + '/generic/'));
+
+  for (const p in ps) {
+    const props = pipelineGetAudioProps(ps[p].path)
+    Object.assign(ps[p], props);
+  }
+
+  return ps;
+}
+const pipelines = getPipelines();
+
+function searchPipelines(id) {
+  if (pipelines[id]) return pipelines[id];
+  return null;
+}
+
+// pipeline list in the format needed by the frontend
+function getPipelineList() {
+  const list = {};
+  for (const id in pipelines) {
+    list[id] = {name: pipelines[id].name, asrc: pipelines[id].asrc, acodec: pipelines[id].acodec};
+  }
+  return list;
+}
 
 
 /*
@@ -3605,12 +4340,13 @@ function sendStatus(conn) {
                                 updating: softUpdateStatus,
                                 ssh: getSshStatus(conn),
                                 wifi: wifiBuildMsg(),
+                                modems: modemsBuildMsg(),
                                 asrcs: Object.keys(audioDevices)}));
 }
 
-async function sendInitialStatus(conn) {
+function sendInitialStatus(conn) {
   conn.send(buildMsg('config', config));
-  conn.send(buildMsg('pipelines', await getPipelineList()));
+  conn.send(buildMsg('pipelines', getPipelineList()));
   if (relaysCache)
     conn.send(buildMsg('relays', buildRelaysMsg()));
   sendStatus(conn);
@@ -3723,6 +4459,9 @@ function handleMessage(conn, msg, isRemote = false) {
         break;
       case 'wifi':
         handleWifi(conn, msg[type]);
+        break;
+      case 'modems':
+        handleModems(conn, msg[type]);
         break;
       case 'logout':
         if (conn.authToken) {
