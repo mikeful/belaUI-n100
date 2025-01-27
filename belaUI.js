@@ -350,7 +350,7 @@ function updateNetif() {
         const isRunning = flags.includes('RUNNING');
 
         // update the list of WiFi devices
-        if (name && name.match('^wlan')) {
+        if (name && name.match('^wl')) {
           let hwAddr = int.match(/ether ([0-9a-f:]+)/);
           if (hwAddr) {
             wiFiDeviceListAdd(name, hwAddr[1], isRunning ? inetAddr : null);
